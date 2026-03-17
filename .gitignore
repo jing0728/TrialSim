@@ -1,0 +1,39 @@
+# ── Python ──────────────────────────────────────────────────
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.env
+
+# ── API Keys (NEVER upload) ──────────────────────────────────
+.env
+.env.*
+secrets.json
+*api_key*
+*apikey*
+
+# ── Raw data (too large for git) ────────────────────────────
+data/raw/raw_studies.json
+data/raw/filtered_studies.json
+
+# ── Parsed & generated data (reproducible from scripts) ─────
+data/raw/parsed_pico.jsonl
+data/raw/atomic_units.jsonl
+data/dialogues/dialogues.jsonl
+data/dialogues/validated.jsonl
+
+# ── Temp / debug scripts ─────────────────────────────────────
+check_missing.py
+sample_for_eval.json
+*.log
+
+# ── OS files ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editor ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
