@@ -180,4 +180,4 @@ def run_parse(max_studies: int = 50):
 
 
 if __name__ == "__main__":
-    run_parse(max_studies=50)
+    run_parse(max_studies=476)
