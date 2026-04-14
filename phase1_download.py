@@ -19,7 +19,6 @@ def fetch_page(page_token=None, page_size=100):
     return resp.json()
 
 def download_sample(max_records=500):
-    """先下载少量数据验证流程，确认无误后再扩大规模"""
     all_studies = []
     next_token = None
     
@@ -33,14 +32,13 @@ def download_sample(max_records=500):
             next_token = data.get("nextPageToken")
             if not next_token:
                 break
-            time.sleep(0.3)  # 避免请求过快
+            time.sleep(0.3)  
     
-    # 保存原始数据
     out_path = os.path.join(OUTPUT_DIR, "raw_studies.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(all_studies[:max_records], f, ensure_ascii=False, indent=2)
     
-    print(f"\n已下载 {len(all_studies[:max_records])} 条，保存到 {out_path}")
+    print(f"\nDownload {len(all_studies[:max_records])} files，save to {out_path}")
     return all_studies[:max_records]
 
 if __name__ == "__main__":
