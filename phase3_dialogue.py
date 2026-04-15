@@ -53,6 +53,57 @@ RECRUITER_QUESTIONS = {
 
 
 # ============================================================
+# FIX 2: Improved criteria detection
+# ============================================================
+
+def detect_real_criteria(trial: dict) -> bool:
+    """
+    Determine whether this trial has enough verifiable thresholds to
+    generate a NEGATIVE_HARD case.
+
+    Original logic only checked demographics.min_age / max_age and
+    non-age atomic_units.  This missed trials where age constraints
+    live inside atomic_units (variable = "Age" or "age") rather than
+    the demographics block — a common result of the LLM parser.
+
+    Extended checks (in order):
+        1. demographics.min_age or max_age is set         (original)
+        2. any non-age atomic_unit has a numeric threshold (original)
+        3. any atomic_unit with variable="age" has a
+           numeric threshold                               (NEW — fixes gap)
+    """
+    demo = trial.get("demographics", {})
+
+    # Check 1: age range in demographics block
+    has_demo_age = (
+        demo.get("min_age", "N/A") != "N/A"
+        or demo.get("max_age", "N/A") != "N/A"
+    )
+    if has_demo_age:
+        return True
+
+    units = trial.get("atomic_units", [])
+
+    # Check 2: non-age lab/numeric unit with a parseable threshold
+    has_lab = any(
+        u.get("threshold", "N/A") != "N/A"
+        for u in units
+        if u.get("variable", "").lower() != "age"
+    )
+    if has_lab:
+        return True
+
+    # Check 3 (NEW): age constraint stored as an atomic_unit instead of
+    # in the demographics block — common when the LLM parser is used
+    has_unit_age = any(
+        u.get("threshold", "N/A") != "N/A"
+        for u in units
+        if u.get("variable", "").lower() == "age"
+    )
+    return has_unit_age
+
+
+# ============================================================
 # Patient profile generator
 # ============================================================
 
@@ -60,16 +111,44 @@ def generate_patient_profile(trial: dict, label: str) -> tuple:
     """
     Generate a virtual patient profile.
     label = 'POSITIVE' (meets all criteria) or 'NEGATIVE_HARD' (violates exactly one unit).
+
+    Age sourcing order (handles both parser outputs):
+        1. demographics.min_age / max_age   (rule-based parser output)
+        2. atomic_units where variable="Age" (LLM parser output)   <-- NEW fallback
     Returns (profile dict, violated_unit dict or None).
     """
-    demo    = trial.get("demographics", {})
-    units   = trial.get("atomic_units", [])
-    profile = {}
+    demo     = trial.get("demographics", {})
+    units    = trial.get("atomic_units", [])
+    profile  = {}
     violated = None
 
     # --- Demographics: Age ---
     min_age = demo.get("min_age", "N/A")
     max_age = demo.get("max_age", "N/A")
+
+    # FIX: if demographics block has no age, fall back to atomic_units
+    if min_age == "N/A" and max_age == "N/A":
+        for u in units:
+            if u.get("variable", "").lower() == "age" and u.get("threshold", "N/A") != "N/A":
+                op  = u.get("operator", "")
+                tau = u.get("threshold", "")
+                # Map atomic unit operator back to min/max age fields
+                if op in [">=", "≥", "between"]:
+                    try:
+                        if op == "between" and "-" in str(tau):
+                            parts   = tau.split("-")
+                            min_age = parts[0].strip()
+                            max_age = parts[1].strip()
+                        else:
+                            min_age = str(int(float(tau)))
+                    except (ValueError, TypeError):
+                        pass
+                elif op in ["<=", "≤"]:
+                    try:
+                        max_age = str(int(float(tau)))
+                    except (ValueError, TypeError):
+                        pass
+                break   # Only use the first age unit found
 
     if min_age != "N/A" and max_age != "N/A":
         try:
@@ -297,19 +376,9 @@ def run_dialogue_synthesis():
     skipped_neg   = 0
 
     for trial in trials:
-        demo = trial.get("demographics", {})
+        # FIX 2: use improved detection that also checks atomic_units age fields
+        has_real_criteria = detect_real_criteria(trial)
 
-        # Check if we have real thresholds to build a valid NEGATIVE_HARD case
-        has_age = (demo.get("min_age", "N/A") != "N/A" or
-                   demo.get("max_age", "N/A") != "N/A")
-        has_lab = any(
-            u.get("threshold", "N/A") != "N/A"
-            for u in trial.get("atomic_units", [])
-            if u.get("variable", "").lower() != "age"
-        )
-        has_real_criteria = has_age or has_lab
-
-        # Only generate NEGATIVE_HARD if real thresholds exist
         labels = ["POSITIVE", "NEGATIVE_HARD"] if has_real_criteria else ["POSITIVE"]
         if not has_real_criteria:
             skipped_neg += 1
@@ -329,6 +398,9 @@ def run_dialogue_synthesis():
                 "violated_unit":   violated,
                 "dialogue":        turns_sct,
                 "turn_count":      len(turns_sct),
+                # FIX 1: carry atomic_units forward so quality_report.py
+                # can compute Section 4 (atomic unit density)
+                "atomic_units":    trial.get("atomic_units", []),
             }
             all_dialogues.append(record)
 
@@ -338,15 +410,15 @@ def run_dialogue_synthesis():
             out.write(json.dumps(d, ensure_ascii=False) + "\n")
 
     # Summary
-    total    = len(all_dialogues)
-    positive = sum(1 for d in all_dialogues if d["label"] == "POSITIVE")
-    negative = sum(1 for d in all_dialogues if d["label"] == "NEGATIVE_HARD")
+    total     = len(all_dialogues)
+    positive  = sum(1 for d in all_dialogues if d["label"] == "POSITIVE")
+    negative  = sum(1 for d in all_dialogues if d["label"] == "NEGATIVE_HARD")
     avg_turns = sum(d["turn_count"] for d in all_dialogues) / total
 
     print(f"Dialogue synthesis complete")
     print(f"  Total dialogues        : {total}")
-    print(f"  POSITIVE               : {positive}")
-    print(f"  NEGATIVE_HARD          : {negative}")
+    print(f"  POSITIVE               : {positive}  ({positive/total*100:.1f}%)")
+    print(f"  NEGATIVE_HARD          : {negative}  ({negative/total*100:.1f}%)")
     print(f"  Skipped (no threshold) : {skipped_neg}")
     print(f"  Avg turns (SCT)        : {avg_turns:.1f}")
     print(f"  Output saved to        : {OUTPUT_PATH}")
@@ -354,12 +426,13 @@ def run_dialogue_synthesis():
     # Sample
     ex = all_dialogues[0]
     print(f"\n=== Sample Dialogue ===")
-    print(f"NCT ID   : {ex['nct_id']}")
-    print(f"Condition: {ex['condition']}")
-    print(f"Label    : {ex['label']}")
-    print(f"Persona  : {ex['persona']}")
-    print(f"Violated : {ex['violated_unit']}")
-    print(f"Turns    : {ex['turn_count']}")
+    print(f"NCT ID        : {ex['nct_id']}")
+    print(f"Condition     : {ex['condition']}")
+    print(f"Label         : {ex['label']}")
+    print(f"Persona       : {ex['persona']}")
+    print(f"Violated      : {ex['violated_unit']}")
+    print(f"Turns         : {ex['turn_count']}")
+    print(f"Atomic units  : {len(ex['atomic_units'])}")
     print()
     for turn in ex["dialogue"]:
         role = turn["role"].upper().ljust(10)
