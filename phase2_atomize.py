@@ -3,326 +3,498 @@ phase2_atomize.py
 
 Criterion Atomization — Phase II of the TrialSim-10k pipeline.
 
-Transforms structured PICO parse results into Atomic Logic Triplets of the
-form <variable, operator, threshold>, then generates a violation scenario
-(the "Negative Hard" pivot point) for each unit.
-
-Two-tier violation generation:
-    Tier 1 (rule-based)  : fast, zero API cost, covers well-formed numerics.
-    Tier 2 (LLM V4)      : Clinical Trial Architect persona; produces a
-                           clinically-grounded violation value, rationale,
-                           and unit label for criteria that rule-based logic
-                           cannot handle precisely.
+Final low-cost upgraded version:
+- Rule-based atomization remains the default backbone
+- GPT-4o-mini is used only for:
+  1) rescuing criteria that would otherwise be dropped
+  2) optionally improving violation metadata for extracted units
 
 Pipeline position:
     parsed_pico.jsonl  ->  [this file]  ->  atomic_units.jsonl
 """
 
+from __future__ import annotations
+
 import json
-import time
 import os
-from anthropic import Anthropic
+import re
+import time
+from typing import Any
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-INPUT_PATH  = "data/raw/parsed_pico.jsonl"
+
+INPUT_PATH = "data/raw/parsed_pico.jsonl"
 OUTPUT_PATH = "data/raw/atomic_units.jsonl"
 
-client = Anthropic()
-MODEL  = "claude-haiku-4-5-20251001"
+# ---------------------------------------------------------------------------
+# OpenAI client
+# ---------------------------------------------------------------------------
+
+MODEL = "gpt-4o-mini"
+API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+client = OpenAI(api_key=API_KEY) if (OpenAI is not None and API_KEY) else None
 
 # ---------------------------------------------------------------------------
-# V4 Logical Architect prompt
+# Prompts
 # ---------------------------------------------------------------------------
-# Design rationale (mirrors paper Table IV evolution):
-#   V1  Narrative      — free-form text, not parseable
-#   V2  Structural     — structured but numerically unaware ("High BP" not "140 mmHg")
-#   V3  Quant. Modeler — found thresholds but skipped violation scenarios
-#   V4  Logical Architect (this) — enforces atomic decomposition, identifies
-#       the exact Pivot Point, and computes a clinically marginal violation.
-#
-# Key prompt constraints:
-#   • "Clinical Trial Architect" persona  → regulatory mindset, not conversational
-#   • Explicit epsilon rules per data type → prevents epsilon=0 or epsilon=100
-#   • "N/A" fallback requirement           → eliminates hallucinated values
-#   • Strict JSON-only output              → safe to parse without repair logic
+
 LOGICAL_ARCHITECT_PROMPT = """\
 You are a Clinical Trial Architect specializing in regulatory compliance.
-Your task is to identify the exact Pivot Point of a single eligibility \
-criterion and design the narrowest possible violation scenario.
+Your task is to identify the exact Pivot Point of a single eligibility criterion
+and design the narrowest possible violation scenario.
 
 Criterion text : {criterion_text}
 Extracted triplet: <{variable}, {operator}, {threshold}>
 
 Return ONLY valid JSON — no markdown, no explanation, no preamble:
 {{
-  "pivot_point":          "{threshold}",
-  "violation_value":      "<value that is just barely outside the boundary>",
-  "violation_rationale":  "<one sentence: why this value is clinically marginal>",
-  "clinical_unit":        "<unit from the source text, e.g. years / mg/dL / % — or N/A>"
+  "pivot_point": "{threshold}",
+  "violation_value": "<value that is just barely outside the boundary>",
+  "violation_rationale": "<one sentence: why this value is clinically marginal>",
+  "clinical_unit": "<unit from the source text, e.g. years / mg/dL / % — or N/A>"
 }}
 
 Epsilon rules (use the SMALLEST clinically meaningful increment):
-  - Age                 : epsilon = 1 year
-  - Continuous lab values (HbA1c, eGFR, BP …) : epsilon = 0.1
-  - Integer scores (ACT, NIHSS …)             : epsilon = 1
-  - Percentages                                : epsilon = 0.1 %
-  - Never invent units that do not appear in the criterion text.
-  - If the threshold cannot be determined, set violation_value to "N/A".\
+- Age: epsilon = 1 year
+- Continuous lab values (HbA1c, eGFR, BP, creatinine, bilirubin): epsilon = 0.1
+- Integer scores (ACT, NIHSS, ECOG): epsilon = 1
+- Percentages: epsilon = 0.1
+- Never invent units that do not appear in the criterion text.
+- If the threshold cannot be determined, set violation_value to "N/A".
 """
+
+TRIPLET_RESCUE_PROMPT = """\
+You extract a single atomic eligibility triplet from one clinical-trial criterion.
+
+Return ONLY valid JSON:
+{{
+  "variable": "...",
+  "operator": "...",
+  "threshold": "..."
+}}
+
+Rules:
+- Allowed operators: >=, <=, >, <, between, =, N/A
+- If the criterion is not numerically or categorically verifiable, return "N/A" for missing fields.
+- "between" thresholds must be formatted as "X-Y"
+- For exact status checks like "HIV negative", operator may be "=" and threshold may be "Negative"
+- Do not add explanation.
+
+Criterion:
+{criterion_text}
+"""
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_json_block(raw: str) -> str | None:
+    """
+    Extract the first plausible JSON object block from model output.
+    Handles cases like:
+      Sure! Here's the JSON:
+      {...}
+    """
+    if not raw:
+        return None
+
+    raw = raw.strip()
+
+    # Fast path: whole response is already JSON
+    if raw.startswith("{") and raw.endswith("}"):
+        return raw
+
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        return match.group(0)
+
+    return None
+
+
+def _call_openai_json(prompt: str, max_output_tokens: int = 220, retries: int = 3) -> dict[str, Any] | None:
+    """
+    Call OpenAI Responses API and parse JSON-only output.
+    Returns parsed dict on success, None on repeated failure.
+    """
+    if client is None:
+        return None
+
+    for attempt in range(retries):
+        try:
+            response = client.responses.create(
+                model=MODEL,
+                input=prompt,
+                max_output_tokens=max_output_tokens,
+            )
+
+            raw = response.output_text.strip()
+            json_text = _extract_json_block(raw)
+            if not json_text:
+                raise ValueError("No JSON found in model output")
+
+            return json.loads(json_text)
+
+        except Exception as exc:
+            print(f"    [LLM retry {attempt + 1}/{retries}] {type(exc).__name__}")
+            if attempt == retries - 1:
+                return None
+            time.sleep(1.5)
+
+    return None
+
+
+def _is_numeric_threshold(threshold: Any) -> bool:
+    """
+    True for:
+      "18"
+      "9.0"
+      "18-65"
+    False for:
+      "Negative"
+      "N/A"
+      ""
+    """
+    if threshold in (None, "", "N/A"):
+        return False
+
+    text = str(threshold).strip()
+
+    if "-" in text:
+        parts = text.split("-")
+        if len(parts) != 2:
+            return False
+        try:
+            float(parts[0].strip())
+            float(parts[1].strip())
+            return True
+        except ValueError:
+            return False
+
+    try:
+        float(text)
+        return True
+    except ValueError:
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Tier 1: rule-based violation generator
 # ---------------------------------------------------------------------------
 
-def generate_violation_rule(operator: str, threshold: str) -> str:
+def generate_violation_rule(operator: str, threshold: Any) -> str:
     """
-    Fast, zero-cost violation value derived from operator + threshold alone.
+    Cheap rule-based violation generation.
 
-    Covers:
-        ">=" / "<="   : step one epsilon outside the bound
-        ">"  / "<"    : the bound itself is the violation (exact equality fails)
-        "between X-Y" : both boundary violations returned as "X-eps or Y+eps"
-
-    Epsilon is 1 for integers, 0.1 for decimals — a deliberate simplification
-    that suffices for age and most lab values at the cost of some clinical
-    granularity (addressed by Tier 2).
-
-    Returns "N/A" when the threshold cannot be parsed as a number.
+    Supports:
+      >=, <=, >, <, between
+    Returns "N/A" for non-numeric thresholds and unsupported operators.
     """
     try:
-        if operator.lower() == "between" and "-" in str(threshold):
-            lo, hi   = threshold.split("-")
-            lo_f, hi_f = float(lo.strip()), float(hi.strip())
-            eps_lo   = 1 if lo_f == int(lo_f) else 0.1
-            eps_hi   = 1 if hi_f == int(hi_f) else 0.1
-            return f"{lo_f - eps_lo} or {hi_f + eps_hi}"
+        op = str(operator).strip().lower()
+        tau = str(threshold).strip()
 
-        val     = float(threshold)
-        epsilon = 1 if val == int(val) else 0.1
+        if op == "between" and "-" in tau:
+            lo_s, hi_s = tau.split("-", 1)
+            lo = float(lo_s.strip())
+            hi = float(hi_s.strip())
+            eps_lo = 1.0 if lo == int(lo) else 0.1
+            eps_hi = 1.0 if hi == int(hi) else 0.1
+            return f"{lo - eps_lo} or {hi + eps_hi}"
 
-        return {
-            ">=" : str(val - epsilon),   # just below lower bound → ineligible
-            "≥"  : str(val - epsilon),
-            "greater than or equal": str(val - epsilon),
-            "<=" : str(val + epsilon),   # just above upper bound → ineligible
-            "≤"  : str(val + epsilon),
-            "less than or equal": str(val + epsilon),
-            ">"  : str(val),             # exactly equal → fails strict ">"
-            "greater than": str(val),
-            "<"  : str(val),             # exactly equal → fails strict "<"
-            "less than": str(val),
-        }.get(operator, "N/A")
+        val = float(tau)
+        epsilon = 1.0 if val == int(val) else 0.1
 
-    except (ValueError, TypeError):
+        mapping = {
+            ">=": str(val - epsilon),
+            "≥": str(val - epsilon),
+            "<=": str(val + epsilon),
+            "≤": str(val + epsilon),
+            ">": str(val),
+            "<": str(val),
+        }
+        return mapping.get(operator, mapping.get(op, "N/A"))
+
+    except Exception:
         return "N/A"
 
+
 # ---------------------------------------------------------------------------
-# Tier 2: LLM V4 Logical Architect enhancement
+# Tier 2a: rescue dropped criteria
 # ---------------------------------------------------------------------------
 
-def enhance_with_llm(unit: dict, retries: int = 3) -> dict:
+def rescue_triplet_with_llm(criterion_text: str, retries: int = 2) -> dict[str, str] | None:
     """
-    Call the Logical Architect (V4) to produce a clinically grounded
-    violation value, a one-sentence rationale, and the correct clinical unit.
-
-    The LLM output is merged on top of the existing unit dict so that all
-    rule-based fields are preserved; only violation metadata is upgraded.
-
-    Falls back gracefully: if the API call fails or returns unparseable JSON
-    after all retries, the original unit is returned unchanged so the pipeline
-    never loses a record.
-
-    Rate-limit strategy: exponential back-off (1 s → 2 s → 4 s).
+    Try to rescue a triplet for criteria that rule-based parsing left as N/A.
+    Returns dict with variable/operator/threshold, or None if rescue failed.
     """
+    data = _call_openai_json(
+        TRIPLET_RESCUE_PROMPT.format(criterion_text=criterion_text),
+        max_output_tokens=120,
+        retries=retries,
+    )
+    if not data:
+        return None
+
+    variable = str(data.get("variable", "N/A")).strip() or "N/A"
+    operator = str(data.get("operator", "N/A")).strip() or "N/A"
+    threshold = str(data.get("threshold", "N/A")).strip() or "N/A"
+
+    if variable == "N/A" or threshold == "N/A":
+        return None
+
+    return {
+        "variable": variable,
+        "operator": operator,
+        "threshold": threshold,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tier 2b: improve violation metadata
+# ---------------------------------------------------------------------------
+
+def enhance_with_llm(unit: dict[str, Any], retries: int = 2) -> dict[str, Any]:
+    """
+    Improve violation metadata for already-extracted units.
+    Falls back gracefully to the original unit.
+    """
+    if client is None or not _is_numeric_threshold(unit.get("threshold", "N/A")):
+        return unit
+
     prompt = LOGICAL_ARCHITECT_PROMPT.format(
-        criterion_text = unit.get("criterion_text", ""),
-        variable       = unit.get("variable",  "N/A"),
-        operator       = unit.get("operator",  "N/A"),
-        threshold      = unit.get("threshold", "N/A"),
+        criterion_text=unit.get("criterion_text", ""),
+        variable=unit.get("variable", "N/A"),
+        operator=unit.get("operator", "N/A"),
+        threshold=unit.get("threshold", "N/A"),
     )
 
-    for attempt in range(retries):
-        try:
-            response = client.messages.create(
-                model     = MODEL,
-                max_tokens= 300,
-                messages  = [{"role": "user", "content": prompt}],
-            )
-            raw = response.content[0].text.strip()
+    data = _call_openai_json(prompt, max_output_tokens=220, retries=retries)
+    if not data:
+        return unit
 
-            # Strip accidental markdown fences (defensive — prompt forbids them)
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-                raw = raw.strip()
+    return {
+        **unit,
+        "pivot_point": data.get("pivot_point", unit.get("threshold", "N/A")),
+        "violation_scenario": data.get("violation_value", unit.get("violation_scenario", "N/A")),
+        "violation_rationale": data.get("violation_rationale", "N/A"),
+        "clinical_unit": data.get("clinical_unit", "N/A"),
+        "violation_source": "llm_v4",
+    }
 
-            enhancement = json.loads(raw)
-
-            return {
-                **unit,
-                # Override rule-based violation with the LLM-computed value
-                "violation_scenario":   enhancement.get("violation_value",     unit["violation_scenario"]),
-                "violation_rationale":  enhancement.get("violation_rationale", "N/A"),
-                "clinical_unit":        enhancement.get("clinical_unit",        "N/A"),
-                "violation_source":     "llm_v4",
-            }
-
-        except json.JSONDecodeError:
-            # LLM returned non-JSON; retry without modifying the unit
-            pass
-        except Exception as exc:
-            if attempt == retries - 1:
-                print(f"    [LLM enhance failed for '{unit.get('variable')}': {exc}]")
-                break
-            time.sleep(2 ** attempt)
-
-    # All retries exhausted — return original unit with source tag
-    return {**unit, "violation_source": "rule_v1_fallback"}
 
 # ---------------------------------------------------------------------------
-# Atomic unit extractor
+# Main atomizer
 # ---------------------------------------------------------------------------
 
-def extract_atomic_units(parsed: dict, use_llm: bool = False) -> dict:
+def extract_atomic_units(
+    parsed: dict[str, Any],
+    use_llm: bool = False,
+    rescue_budget: list[int] | None = None,
+    enhance_budget: list[int] | None = None,
+) -> dict[str, Any]:
     """
-    Convert one PICO-parsed trial record into a list of Atomic Logic Triplets.
+    Convert parsed criteria into atomic units.
 
-    Each triplet:  ai = <variable, operator, threshold>
-
-    Filtering rule: units with variable="N/A" or threshold="N/A" are dropped
-    because they cannot be used to generate verifiable boundary cases.
-
-    use_llm=True activates Tier 2 enhancement for every unit that has a
-    non-"N/A" violation_scenario from Tier 1.  Set to False for fast/cheap
-    bulk runs; enable selectively for high-value trials.
+    Strategy:
+    1) Use existing rule-based fields from phase1_parse.py
+    2) If variable/threshold is missing, optionally rescue with GPT-4o-mini
+    3) Generate rule-based violation
+    4) Optionally upgrade violation metadata with GPT-4o-mini
     """
-    units: list[dict] = []
+    units: list[dict[str, Any]] = []
 
     for crit_type in ("inclusion_criteria", "exclusion_criteria"):
-        label = crit_type.split("_")[0]   # "inclusion" | "exclusion"
-        for crit in parsed.get(crit_type, []):
-            v   = crit.get("variable",  "N/A")
-            op  = crit.get("operator",  "N/A")
-            tau = crit.get("threshold", "N/A")
+        label = crit_type.split("_")[0]
 
-            # Skip under-specified criteria — unusable for boundary generation
-            if v == "N/A" or tau == "N/A":
+        for crit in parsed.get(crit_type, []):
+            recovered = None
+
+            criterion_text = crit.get("criterion", "")
+            variable = crit.get("variable", "N/A")
+            operator = crit.get("operator", "N/A")
+            threshold = crit.get("threshold", "N/A")
+
+            rescued = False
+
+            # ---------------------------------------------------------------
+            # Rescue otherwise-dropped criteria
+            # ---------------------------------------------------------------
+            if (
+                use_llm
+                and client is not None
+                and (variable == "N/A" or threshold == "N/A")
+                and rescue_budget is not None
+                and rescue_budget[0] > 0
+            ):
+                recovered = rescue_triplet_with_llm(criterion_text)
+
+                if recovered:
+                    rescue_budget[0] -= 1
+                    variable = recovered["variable"]
+                    operator = recovered["operator"]
+                    threshold = recovered["threshold"]
+                    rescued = True
+
+            # Still unusable -> skip
+            if variable == "N/A" or threshold == "N/A":
                 continue
 
-            unit: dict = {
-                "variable":         v,
-                "operator":         op,
-                "threshold":        tau,
-                "type":             label,
-                "criterion_text":   crit.get("criterion", ""),
-                # Tier 1 baseline — always computed
-                "violation_scenario": generate_violation_rule(op, tau),
-                "violation_source": "rule_v1",
+            unit = {
+                "variable": variable,
+                "operator": operator,
+                "threshold": threshold,
+                "type": label,
+                "criterion_text": criterion_text,
+                "violation_scenario": generate_violation_rule(operator, threshold),
+                "violation_source": "rule_v1_rescued" if rescued else "rule_v1",
             }
 
-            # Tier 2 upgrade — LLM adds clinical rationale and precise unit
-            if use_llm and unit["violation_scenario"] != "N/A":
-                unit = enhance_with_llm(unit)
+            # Optional enhancement only for numeric-threshold units
+            if (
+                use_llm
+                and client is not None
+                and _is_numeric_threshold(threshold)
+                and enhance_budget is not None
+                and enhance_budget[0] > 0
+            ):
+                upgraded = enhance_with_llm(unit)
+
+                if upgraded.get("violation_source") == "llm_v4":
+                    enhance_budget[0] -= 1
+
+                unit = upgraded
 
             units.append(unit)
 
     return {
-        "nct_id":       parsed.get("nct_id"),
-        "condition":    parsed.get("condition"),
+        "nct_id": parsed.get("nct_id"),
+        "condition": parsed.get("condition"),
         "demographics": parsed.get("demographics"),
         "atomic_units": units,
     }
 
+
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Runner
 # ---------------------------------------------------------------------------
 
-def run_atomize(use_llm: bool = False, llm_limit: int = 50) -> list[dict]:
+def run_atomize(
+    use_llm: bool = False,
+    llm_rescue_limit: int = 10,
+    llm_enhance_limit: int = 5,
+    max_trials: int | None = 20,
+) -> list[dict[str, Any]]:
     """
-    Process all records in parsed_pico.jsonl and write atomic_units.jsonl.
+    Run atomization over parsed_pico.jsonl.
 
-    Parameters
-    ----------
-    use_llm   : activate Tier 2 LLM enhancement (slower, costs API calls)
-    llm_limit : max number of trials to send through LLM enhancement;
-                ignored when use_llm=False.  Useful for partial upgrades
-                on high-value disease categories (e.g. Oncology only).
+    Safe low-cost defaults:
+    - rescue first 10 dropped criteria
+    - enhance first 5 numeric units
+    - process first 20 trials only
 
-    Quality signals printed at the end:
-        - extraction rate  (how many units were kept vs dropped)
-        - violation coverage (how many got a non-"N/A" violation value)
-        - LLM upgrade rate   (only when use_llm=True)
+    Once confirmed working, scale these values upward.
     """
-    results:    list[dict] = []
-    llm_count:  int        = 0
+    results: list[dict[str, Any]] = []
+    rescue_budget = [llm_rescue_limit]
+    enhance_budget = [llm_enhance_limit]
 
-    with open(INPUT_PATH, encoding="utf-8") as f, \
-         open(OUTPUT_PATH, "w", encoding="utf-8") as out:
+    if use_llm and client is None:
+        print("[WARN] OPENAI_API_KEY not set or OpenAI package unavailable.")
+        print("[WARN] Falling back to rule-only mode.")
 
-        for line in f:
-            parsed = json.loads(line.strip())
+    with open(INPUT_PATH, encoding="utf-8") as f, open(OUTPUT_PATH, "w", encoding="utf-8") as out:
+        for idx, line in enumerate(f, start=1):
+            if max_trials is not None and idx > max_trials:
+                break
 
-            # Apply LLM only up to llm_limit to control cost during testing
-            run_llm = use_llm and llm_count < llm_limit
-            atomized = extract_atomic_units(parsed, use_llm=run_llm)
+            line = line.strip()
+            if not line:
+                continue
 
-            if run_llm:
-                llm_count += 1
+            parsed = json.loads(line)
+            nct_id = parsed.get("nct_id", f"#{idx}")
+            print(f"[{idx}] Processing {nct_id}...")
+
+            atomized = extract_atomic_units(
+                parsed,
+                use_llm=use_llm,
+                rescue_budget=rescue_budget,
+                enhance_budget=enhance_budget,
+            )
+
+            print(
+                f"    units={len(atomized.get('atomic_units', []))} | "
+                f"rescue_left={rescue_budget[0]} | "
+                f"enhance_left={enhance_budget[0]}"
+            )
 
             out.write(json.dumps(atomized, ensure_ascii=False) + "\n")
             results.append(atomized)
 
-    # --- Quality report ---
-    total_units      = sum(len(r["atomic_units"]) for r in results)
-    covered          = sum(
-        1 for r in results
+    total_units = sum(len(r["atomic_units"]) for r in results)
+    covered = sum(
+        1
+        for r in results
         for u in r["atomic_units"]
-        if u["violation_scenario"] != "N/A"
+        if u.get("violation_scenario", "N/A") != "N/A"
     )
-    llm_upgraded     = sum(
-        1 for r in results
+    llm_v4 = sum(
+        1
+        for r in results
         for u in r["atomic_units"]
         if u.get("violation_source") == "llm_v4"
     )
+    rescued = sum(
+        1
+        for r in results
+        for u in r["atomic_units"]
+        if u.get("violation_source") == "rule_v1_rescued"
+    )
 
-    print(f"Atomization complete : {len(results)} trials processed")
+    print(f"\nAtomization complete : {len(results)} trials processed")
     print(f"Total atomic units   : {total_units}")
-    print(f"Violation coverage   : {covered}/{total_units} "
-          f"({covered / total_units * 100:.1f}%)" if total_units else "")
+    if total_units:
+        print(f"Violation coverage   : {covered}/{total_units} ({covered / total_units * 100:.1f}%)")
+    else:
+        print("Violation coverage   : 0/0 (0.0%)")
+
     if use_llm:
-        print(f"LLM V4 upgrades      : {llm_upgraded}/{total_units}")
+        print(f"LLM rescued units    : {rescued}")
+        print(f"LLM enhanced units   : {llm_v4}")
+        print(f"Rescue budget left   : {rescue_budget[0]}")
+        print(f"Enhance budget left  : {enhance_budget[0]}")
+
     print(f"Output saved to      : {OUTPUT_PATH}")
 
-    # --- Sample output ---
     if results:
+        sample = next((r for r in results if r["atomic_units"]), results[0])
         print("\n=== Sample Output ===")
-        ex = results[0]
-        print(f"NCT ID       : {ex['nct_id']}")
-        print(f"Condition    : {ex['condition']}")
-        print(f"Demographics : {ex['demographics']}")
-        print(f"Atomic units : {len(ex['atomic_units'])}")
-        print()
-        for u in ex["atomic_units"][:5]:
-            print(f"  Triplet    : <{u['variable']}, {u['operator']}, {u['threshold']}>")
-            print(f"  Type       : {u['type']}")
-            print(f"  Violation  : {u['violation_scenario']}")
-            if u.get("violation_rationale"):
-                print(f"  Rationale  : {u['violation_rationale']}")
-            if u.get("clinical_unit"):
-                print(f"  Unit       : {u['clinical_unit']}")
-            print(f"  Source     : {u.get('violation_source', 'rule_v1')}")
+        print(f"NCT ID       : {sample.get('nct_id')}")
+        print(f"Condition    : {sample.get('condition')}")
+        print(f"Demographics : {sample.get('demographics')}")
+        print(f"Atomic units : {len(sample.get('atomic_units', []))}")
+
+        for unit in sample.get("atomic_units", [])[:5]:
             print()
+            print(f"  Triplet    : <{unit.get('variable')}, {unit.get('operator')}, {unit.get('threshold')}>")
+            print(f"  Type       : {unit.get('type')}")
+            print(f"  Violation  : {unit.get('violation_scenario')}")
+            print(f"  Source     : {unit.get('violation_source')}")
 
     return results
 
 
 if __name__ == "__main__":
-    # Quick run (rule-based only, free):
-    #   run_atomize()
-    #
-    # LLM-enhanced run on first 50 trials:
-    #   run_atomize(use_llm=True, llm_limit=50)
-    run_atomize(use_llm=False)
+    run_atomize(
+        use_llm=True,
+        llm_rescue_limit=50,
+        llm_enhance_limit=20,
+        max_trials=100,
+    )

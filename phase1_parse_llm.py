@@ -1,81 +1,80 @@
 """
 phase1_parse_llm.py
 
-LLM-based PICO parser — Phase I of the TrialSim-10k pipeline.
+Final LLM-based Phase I parser for TrialSim.
 
-Reads filtered_studies.json and parses each trial's eligibility criteria
-into structured PICO format using Claude as a zero-shot parser.
-
-Key improvements over the original version:
-    1. Richer system prompt with explicit operator/threshold examples
-       → LLM now extracts HbA1c, eGFR, ECOG, scores etc., not just age
-    2. Criteria split before truncation
-       → inclusion and exclusion sections are each given 2000 chars,
-         preventing one section from crowding out the other
-    3. max_tokens raised from 2000 → 3000
-       → handles trials with 20+ criteria without truncation
-    4. Retry with a focused repair prompt when repair_json fails
-       → recovers ~60% of previously failed parses
-    5. Quality report now shows criterion-level threshold extraction rate
-       → reveals whether lab/score thresholds are being captured
+Goal:
+    Convert filtered_studies.json into parsed_pico.jsonl with richer criterion extraction,
+    including:
+      - numeric constraints
+      - categorical constraints
+      - status / presence / absence constraints
 
 Pipeline position:
     filtered_studies.json  ->  [this file]  ->  parsed_pico.jsonl
 """
 
+from __future__ import annotations
+
 import json
 import os
+import re
 import time
-from anthropic import Anthropic
+from typing import Any
 
-INPUT_PATH  = "data/raw/filtered_studies.json"
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+INPUT_PATH = "data/raw/filtered_studies.json"
 OUTPUT_PATH = "data/raw/parsed_pico.jsonl"
+CHECKPOINT_PATH = OUTPUT_PATH + ".done"
 
-client = Anthropic()
-MODEL  = "claude-haiku-4-5-20251001"
+MODEL = "gpt-4o-mini"
+API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+client = OpenAI(api_key=API_KEY) if (OpenAI is not None and API_KEY) else None
 
 # ---------------------------------------------------------------------------
-# System prompt — V3 Structured Parser with threshold extraction examples
+# Prompts
 # ---------------------------------------------------------------------------
-# Original prompt only mentioned age extraction.
-# Improved version adds explicit examples for lab values, scores, and
-# temporal constraints so the LLM knows to extract them as triplets.
+
 SYSTEM_PROMPT = """\
 You are a senior Clinical Data Scientist specializing in regulatory compliance.
 Parse clinical trial eligibility criteria into strict JSON.
 
-RULES:
-- Output ONLY valid JSON — no markdown, no explanation, no preamble.
-- For any field not explicitly stated in the text, use exactly "N/A".
-- Never fabricate or infer values not present in the text.
-- Extract numerical boundaries precisely.
-- For criteria lines with no numeric threshold, set operator and threshold to "N/A".
+You must extract ALL verifiable constraints, not only numeric ones.
 
-OPERATOR EXTRACTION GUIDE — use these exact operator strings:
-  ">="  for "at least", "or older", "or more", "≥", "minimum"
-  "<="  for "no more than", "or younger", "or less", "≤", "maximum"
-  ">"   for "greater than", "more than", "above"
-  "<"   for "less than", "fewer than", "below", "under"
-  "between"  for "X to Y", "X - Y", "between X and Y", "from X to Y"
-  "="   for "must be", "required to be", "confirmed", "positive", "negative"
+Allowed operator values:
+- ">="
+- "<="
+- ">"
+- "<"
+- "between"
+- "="
+- "presence"
+- "absence"
+- "N/A"
 
-THRESHOLD EXTRACTION EXAMPLES:
-  "aged 18 to 65"                    -> variable="Age",  operator="between", threshold="18-65"
-  "at least 18 years old"            -> variable="Age",  operator=">=",      threshold="18"
-  "HbA1c less than 7.0%"             -> variable="HbA1c", operator="<",      threshold="7.0"
-  "eGFR >= 30 mL/min"                -> variable="eGFR", operator=">=",      threshold="30"
-  "ECOG performance status 0 or 1"   -> variable="ECOG performance status", operator="<=", threshold="1"
-  "BMI between 18.5 and 35"          -> variable="BMI",  operator="between", threshold="18.5-35"
-  "systolic BP < 140 mmHg"           -> variable="Systolic BP", operator="<", threshold="140"
-  "platelet count >= 100 x10^9/L"    -> variable="Platelet count", operator=">=", threshold="100"
-  "within 30 days of diagnosis"      -> variable="Days since diagnosis", operator="<=", threshold="30"
-  "no prior chemotherapy"            -> variable="Prior chemotherapy", operator="=", threshold="N/A"
-  "confirmed HIV negative"           -> variable="HIV status", operator="=", threshold="Negative"\
+Rules:
+- Output ONLY valid JSON.
+- No markdown, no explanation, no preamble.
+- Never fabricate values.
+- If a field is not explicitly stated, use "N/A".
+- Extract every criterion line as a separate object.
+- For demographics.gender, use "Male", "Female", or "Both".
+
+Examples:
+- "aged 18 to 65" -> variable="Age", operator="between", threshold="18-65"
+- "at least 18 years old" -> variable="Age", operator=">=", threshold="18"
+- "HbA1c less than 7.0%" -> variable="HbA1c", operator="<", threshold="7.0"
+- "ECOG performance status 0 or 1" -> variable="ECOG performance status", operator="between", threshold="0-1"
+- "confirmed HIV negative" -> variable="HIV status", operator="=", threshold="Negative"
+- "informed consent signed" -> variable="Informed consent", operator="presence", threshold="Signed"
+- "no prior chemotherapy" -> variable="Prior chemotherapy", operator="absence", threshold="Chemotherapy"
+- "histologically confirmed urothelial carcinoma" -> variable="Cancer type", operator="=", threshold="Urothelial carcinoma"
 """
 
-# ---------------------------------------------------------------------------
-# User template
-# ---------------------------------------------------------------------------
 USER_TEMPLATE = """\
 Parse the eligibility criteria below into this exact JSON structure.
 
@@ -96,75 +95,92 @@ Parse the eligibility criteria below into this exact JSON structure.
 }}
 
 IMPORTANT:
-- Extract EVERY criterion line as a separate object, even non-numeric ones.
-- For numeric criteria, always fill in variable, operator, and threshold.
+- Extract EVERY criterion line as a separate object, including numeric, categorical, and status constraints.
+- For numeric criteria, always fill variable/operator/threshold when present.
+- For categorical criteria, use operator "=".
+- For status constraints like signed/confirmed/present, use operator "presence".
+- For "no X" constraints, use operator "absence".
 - demographics.min_age / max_age must be plain numbers like "18", not "18 years".
-- demographics.gender: use "Male", "Female", or "Both".
 
 Eligibility Criteria:
-{criteria_text}\
+{criteria_text}
 """
 
-# Repair prompt — used when the first parse fails.
-# Feeds the broken output back to the LLM and asks it to fix only the JSON.
 REPAIR_PROMPT = """\
 The following text should be valid JSON but has a syntax error.
-Fix ONLY the JSON syntax — do not change any values or add new fields.
-Return ONLY the corrected JSON, nothing else.
+Fix ONLY the JSON syntax. Do not change any values or add new fields.
+Return ONLY corrected JSON.
 
 Broken JSON:
-{broken}\
+{broken}
 """
 
 # ---------------------------------------------------------------------------
-# Criteria pre-processor
+# Helpers
 # ---------------------------------------------------------------------------
 
-def prepare_criteria_text(raw_criteria: str, max_chars_each: int = 2000) -> str:
-    """
-    Split the raw eligibility text into inclusion and exclusion sections,
-    then truncate each section independently to max_chars_each characters.
+def _extract_json_block(raw: str) -> str | None:
+    if not raw:
+        return None
 
-    Why this matters:
-        Original code truncated the whole text at 3000 chars.  For trials
-        with long inclusion sections, the exclusion section was often
-        completely cut off, so no exclusion criteria were ever parsed.
+    raw = raw.strip()
 
-        With independent 2000-char budgets, both sections are always
-        represented — giving a total input of up to 4000 chars.
-    """
-    import re
+    if raw.startswith("{") and raw.endswith("}"):
+        return raw
 
-    # Split on the "Exclusion Criteria" header (case-insensitive)
-    parts = re.split(r'(?i)(?=exclusion\s+criteria)', raw_criteria, maxsplit=1)
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        return match.group(0)
 
-    if len(parts) == 2:
-        inclusion_text = parts[0].strip()[:max_chars_each]
-        exclusion_text = parts[1].strip()[:max_chars_each]
-        return inclusion_text + "\n\n" + exclusion_text
-    else:
-        # Could not split — fall back to original truncation
-        return raw_criteria[:max_chars_each * 2]
+    return None
 
-# ---------------------------------------------------------------------------
-# JSON repair helpers
-# ---------------------------------------------------------------------------
+
+def _call_openai_text(
+    prompt: str,
+    *,
+    system: str | None = None,
+    max_output_tokens: int = 3000,
+    retries: int = 4,
+) -> str | None:
+    if client is None:
+        return None
+
+    for attempt in range(retries):
+        try:
+            if system:
+                response = client.responses.create(
+                    model=MODEL,
+                    instructions=system,
+                    input=prompt,
+                    max_output_tokens=max_output_tokens,
+                )
+            else:
+                response = client.responses.create(
+                    model=MODEL,
+                    input=prompt,
+                    max_output_tokens=max_output_tokens,
+                )
+            return response.output_text.strip()
+
+        except Exception as exc:
+            print(f"    [LLM retry {attempt + 1}/{retries}] {type(exc).__name__}")
+            if attempt == retries - 1:
+                return None
+            time.sleep(2 ** attempt)
+
+    return None
+
 
 def repair_json_local(raw: str) -> dict | None:
     """
-    Three-pass local repair — no API call required.
-
-    Pass 1: direct json.loads
-    Pass 2: find the outermost closing brace and truncate
-    Pass 3: strip trailing incomplete lines one by one
+    Three-pass local repair.
     """
-    # Pass 1
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
 
-    # Pass 2: walk character by character tracking brace depth
+    # outermost brace truncate
     depth = 0
     for i, ch in enumerate(raw):
         if ch == "{":
@@ -177,7 +193,7 @@ def repair_json_local(raw: str) -> dict | None:
                 except json.JSONDecodeError:
                     break
 
-    # Pass 3: remove lines from the end until valid
+    # strip trailing lines
     lines = raw.splitlines()
     for n in range(len(lines), 0, -1):
         candidate = "\n".join(lines[:n]).strip()
@@ -192,211 +208,279 @@ def repair_json_local(raw: str) -> dict | None:
 
 
 def repair_json_llm(broken: str) -> dict | None:
-    """
-    LLM-assisted repair — called only when all local passes fail.
-    Sends the broken JSON back to the model and asks for a syntax fix only.
-    Uses a short max_tokens budget since we only need minor corrections.
-    """
-    try:
-        prompt = REPAIR_PROMPT.format(broken=broken[:3000])
-        response = client.messages.create(
-            model      = MODEL,
-            max_tokens = 1000,
-            messages   = [{"role": "user", "content": prompt}],
-        )
-        fixed = response.content[0].text.strip()
-
-        # Strip any markdown fences the model added
-        if fixed.startswith("```"):
-            fixed = fixed.split("```")[1]
-            if fixed.startswith("json"):
-                fixed = fixed[4:]
-            fixed = fixed.strip()
-
-        return json.loads(fixed)
-    except Exception:
+    fixed = _call_openai_text(
+        REPAIR_PROMPT.format(broken=broken[:4000]),
+        max_output_tokens=1200,
+        retries=2,
+    )
+    if not fixed:
         return None
 
-# ---------------------------------------------------------------------------
-# Single-study parser
-# ---------------------------------------------------------------------------
-
-def parse_one_study(study: dict) -> dict | None:
-    """
-    Parse one study record through the LLM and return a structured dict.
-
-    Repair strategy (in order of cost):
-        1. Local three-pass repair    (free)
-        2. LLM repair prompt          (1 extra API call)
-        3. Return None                (record is dropped)
-    """
-    try:
-        module    = study.get("protocolSection", {})
-        nct_id    = module.get("identificationModule", {}).get("nctId", "UNKNOWN")
-        criteria  = module.get("eligibilityModule",   {}).get("eligibilityCriteria", "")
-        condition = module.get("conditionsModule",    {}).get("conditions", ["N/A"])[0]
-
-        # Pre-process: split inclusion/exclusion and truncate each independently
-        criteria_text = prepare_criteria_text(criteria)
-
-        prompt = USER_TEMPLATE.format(
-            nct_id        = nct_id,
-            condition     = condition,
-            criteria_text = criteria_text,
-        )
-
-        response = client.messages.create(
-            model      = MODEL,
-            max_tokens = 3000,   # raised from 2000 to handle trials with 20+ criteria
-            system     = SYSTEM_PROMPT,
-            messages   = [{"role": "user", "content": prompt}],
-        )
-
-        raw = response.content[0].text.strip()
-
-        # Strip markdown code fences (defensive — prompt forbids them)
-        if "```" in raw:
-            parts = raw.split("```")
-            raw   = parts[1] if len(parts) > 1 else parts[0]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        # Repair pass 1: local
-        result = repair_json_local(raw)
-        if result:
-            return result
-
-        # Repair pass 2: LLM-assisted
-        result = repair_json_llm(raw)
-        return result   # None if both passes fail
-
-    except Exception as exc:
-        print(f"  Error: {exc}")
+    block = _extract_json_block(fixed)
+    if not block:
         return None
 
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
+    try:
+        return json.loads(block)
+    except json.JSONDecodeError:
+        return None
 
-def run_parse(max_studies: int = 50, delay: float = 0.3) -> None:
+
+def prepare_criteria_text(raw_criteria: str, max_chars_each: int = 2200) -> str:
     """
-    Parse up to max_studies trials and write results to OUTPUT_PATH.
-
-    Quality report printed at the end covers:
-        - Parse success rate
-        - Demographics extraction rate (age, gender)
-        - Criterion-level threshold extraction rate  ← NEW
-          Shows what % of criteria have numeric variable/operator/threshold,
-          which directly predicts the NEGATIVE_HARD coverage in Phase III.
-
-    Recommended workflow:
-        run_parse(max_studies=50)    # verify quality on a small batch
-        run_parse(max_studies=476)   # full dataset once quality looks good
+    Split into inclusion / exclusion and truncate each independently.
     """
+    if not raw_criteria:
+        return ""
+
+    parts = re.split(r'(?i)(?=exclusion\s+criteria)', raw_criteria, maxsplit=1)
+
+    if len(parts) == 2:
+        inclusion_text = parts[0].strip()[:max_chars_each]
+        exclusion_text = parts[1].strip()[:max_chars_each]
+        return inclusion_text + "\n\n" + exclusion_text
+
+    return raw_criteria[: max_chars_each * 2]
+
+
+def normalize_record(data: dict[str, Any], nct_id: str, condition: str) -> dict[str, Any]:
+    """
+    Ensure the final schema is complete and safe.
+    """
+    demo = data.get("demographics", {}) if isinstance(data, dict) else {}
+
+    normalized = {
+        "nct_id": data.get("nct_id", nct_id) if isinstance(data, dict) else nct_id,
+        "condition": data.get("condition", condition) if isinstance(data, dict) else condition,
+        "demographics": {
+            "min_age": str(demo.get("min_age", "N/A")) if demo else "N/A",
+            "max_age": str(demo.get("max_age", "N/A")) if demo else "N/A",
+            "gender": str(demo.get("gender", "N/A")) if demo else "N/A",
+        },
+        "inclusion_criteria": [],
+        "exclusion_criteria": [],
+    }
+
+    for key in ("inclusion_criteria", "exclusion_criteria"):
+        items = data.get(key, []) if isinstance(data, dict) else []
+        if not isinstance(items, list):
+            items = []
+
+        cleaned = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            cleaned.append({
+                "criterion": str(item.get("criterion", "N/A")).strip() or "N/A",
+                "variable": str(item.get("variable", "N/A")).strip() or "N/A",
+                "operator": str(item.get("operator", "N/A")).strip() or "N/A",
+                "threshold": str(item.get("threshold", "N/A")).strip() or "N/A",
+            })
+        normalized[key] = cleaned
+
+    return normalized
+
+
+def parse_one_study(study: dict, max_retries: int = 4) -> dict | None:
+    module = study.get("protocolSection", {})
+    nct_id = module.get("identificationModule", {}).get("nctId", "UNKNOWN")
+    criteria = module.get("eligibilityModule", {}).get("eligibilityCriteria", "")
+    condition = module.get("conditionsModule", {}).get("conditions", ["N/A"])[0]
+
+    if not criteria:
+        return None
+
+    criteria_text = prepare_criteria_text(criteria)
+    prompt = USER_TEMPLATE.format(
+        nct_id=nct_id,
+        condition=condition,
+        criteria_text=criteria_text,
+    )
+
+    for attempt in range(max_retries):
+        raw = _call_openai_text(
+            prompt,
+            system=SYSTEM_PROMPT,
+            max_output_tokens=3200,
+            retries=2,
+        )
+        if not raw:
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(2 ** attempt)
+            continue
+
+        block = _extract_json_block(raw)
+        if not block:
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(2 ** attempt)
+            continue
+
+        parsed = repair_json_local(block)
+        if parsed is None:
+            parsed = repair_json_llm(block)
+
+        if parsed is not None:
+            return normalize_record(parsed, nct_id=nct_id, condition=condition)
+
+        if attempt < max_retries - 1:
+            time.sleep(2 ** attempt)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+def print_quality_report(records: list[dict]) -> None:
+    total = len(records)
+    if total == 0:
+        print("\n=== Quality Report ===")
+        print("  No parsed records.")
+        return
+
+    min_age_count = sum(1 for r in records if r["demographics"].get("min_age") != "N/A")
+    max_age_count = sum(1 for r in records if r["demographics"].get("max_age") != "N/A")
+    gender_count = sum(1 for r in records if r["demographics"].get("gender") != "N/A")
+
+    inc_counts = [len(r.get("inclusion_criteria", [])) for r in records]
+    exc_counts = [len(r.get("exclusion_criteria", [])) for r in records]
+
+    all_criteria = sum(inc_counts) + sum(exc_counts)
+
+    numeric_ops = {">=", "<=", ">", "<", "between"}
+    numeric_threshold_count = 0
+    categorical_or_status_count = 0
+
+    for r in records:
+        for key in ("inclusion_criteria", "exclusion_criteria"):
+            for item in r.get(key, []):
+                op = item.get("operator", "N/A")
+                threshold = item.get("threshold", "N/A")
+                if op in numeric_ops and threshold != "N/A":
+                    numeric_threshold_count += 1
+                elif op in {"=", "presence", "absence"} and threshold != "N/A":
+                    categorical_or_status_count += 1
+
+    print("\n=== Quality Report ===")
+    print(f"  Parsed records    : {total}")
+    print(f"  min_age extracted : {min_age_count}/{total} ({min_age_count / total * 100:.1f}%)")
+    print(f"  max_age extracted : {max_age_count}/{total} ({max_age_count / total * 100:.1f}%)")
+    print(f"  gender extracted  : {gender_count}/{total} ({gender_count / total * 100:.1f}%)")
+    print()
+    print(f"  Avg inclusion criteria / trial : {sum(inc_counts) / total:.1f}")
+    print(f"  Avg exclusion criteria / trial : {sum(exc_counts) / total:.1f}")
+    print()
+    print(f"  Criteria with numeric threshold     : {numeric_threshold_count}/{all_criteria} ({numeric_threshold_count / all_criteria * 100:.1f}%)")
+    print(f"  Categorical / status constraints    : {categorical_or_status_count}/{all_criteria} ({categorical_or_status_count / all_criteria * 100:.1f}%)")
+    print(f"  Total structured constraints        : {(numeric_threshold_count + categorical_or_status_count)}/{all_criteria} ({(numeric_threshold_count + categorical_or_status_count) / all_criteria * 100:.1f}%)")
+
+    sample = records[0]
+    print("\n=== Sample Output ===")
+    print(f"NCT ID     : {sample.get('nct_id')}")
+    print(f"Condition  : {sample.get('condition')}")
+    print(f"Age range  : {sample['demographics'].get('min_age')} ~ {sample['demographics'].get('max_age')}")
+    print(f"Gender     : {sample['demographics'].get('gender')}")
+    print(f"Inclusion  : {len(sample.get('inclusion_criteria', []))} criteria")
+    print(f"Exclusion  : {len(sample.get('exclusion_criteria', []))} criteria")
+
+    shown = 0
+    print("\nSample structured criteria:")
+    for key in ("inclusion_criteria", "exclusion_criteria"):
+        for item in sample.get(key, [])[:10]:
+            print(f"  Criterion : {item['criterion'][:90]}")
+            print(f"  Triplet   : <{item['variable']}, {item['operator']}, {item['threshold']}>")
+            print()
+            shown += 1
+            if shown >= 3:
+                return
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+def run_parse(max_studies: int | None = None, overwrite: bool = False) -> list[dict]:
+    if client is None:
+        raise RuntimeError("OpenAI client unavailable. Install openai and set OPENAI_API_KEY.")
+
     with open(INPUT_PATH, encoding="utf-8") as f:
         studies = json.load(f)
 
-    studies = studies[:max_studies]
-    success = 0
-    failed  = []
+    if max_studies is not None:
+        studies = studies[:max_studies]
 
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as out:
-        for i, study in enumerate(studies):
-            nct_id = (
-                study.get("protocolSection", {})
-                     .get("identificationModule", {})
-                     .get("nctId", f"#{i}")
-            )
-            print(f"[{i + 1}/{len(studies)}] Parsing {nct_id}...", end=" ", flush=True)
+    if overwrite:
+        if os.path.exists(OUTPUT_PATH):
+            os.remove(OUTPUT_PATH)
+        if os.path.exists(CHECKPOINT_PATH):
+            os.remove(CHECKPOINT_PATH)
+
+    done_ids: set[str] = set()
+    if os.path.exists(CHECKPOINT_PATH):
+        with open(CHECKPOINT_PATH, encoding="utf-8") as f:
+            done_ids = {line.strip() for line in f if line.strip()}
+
+    pending = []
+    for s in studies:
+        sid = (
+            s.get("protocolSection", {})
+             .get("identificationModule", {})
+             .get("nctId", "")
+        )
+        if sid not in done_ids:
+            pending.append(s)
+
+    print(f"Resuming — {len(done_ids)} records already done, {len(pending)} remaining.")
+
+    parsed_records: list[dict] = []
+
+    # load already-parsed records for reporting
+    if os.path.exists(OUTPUT_PATH):
+        with open(OUTPUT_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        parsed_records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+
+    out_mode = "a" if os.path.exists(OUTPUT_PATH) and not overwrite else "w"
+
+    with open(OUTPUT_PATH, out_mode, encoding="utf-8") as out, \
+         open(CHECKPOINT_PATH, "a", encoding="utf-8") as ckpt:
+
+        total = len(studies)
+        completed = len(done_ids)
+
+        for study in pending:
+            module = study.get("protocolSection", {})
+            nct_id = module.get("identificationModule", {}).get("nctId", "UNKNOWN")
+
+            print(f"[{completed + 1}/{total}] Parsing {nct_id}...", end=" ")
 
             parsed = parse_one_study(study)
-            if parsed:
+            if parsed is not None:
                 out.write(json.dumps(parsed, ensure_ascii=False) + "\n")
-                success += 1
+                out.flush()
+
+                ckpt.write(nct_id + "\n")
+                ckpt.flush()
+
+                parsed_records.append(parsed)
+                completed += 1
                 print("✓")
             else:
-                failed.append(nct_id)
                 print("✗")
 
-            time.sleep(delay)
-
-    print(f"\nParsing complete: {success}/{len(studies)} succeeded")
-    if failed:
-        print(f"Failed ({len(failed)}): {', '.join(failed[:10])}"
-              + (" ..." if len(failed) > 10 else ""))
-
-    # --- Quality report ---
-    with open(OUTPUT_PATH, encoding="utf-8") as f:
-        results = [json.loads(line) for line in f]
-
-    total = len(results)
-    if total == 0:
-        print("No results to report.")
-        return
-
-    # Demographics extraction rates
-    has_min_age = sum(1 for r in results if r["demographics"]["min_age"] != "N/A")
-    has_max_age = sum(1 for r in results if r["demographics"]["max_age"] != "N/A")
-    has_gender  = sum(1 for r in results if r["demographics"]["gender"]  != "N/A")
-
-    # Criterion-level threshold extraction rate (NEW)
-    # Count how many individual criteria have a non-"N/A" numeric threshold.
-    # This is the direct predictor of Phase II atomic unit count and
-    # ultimately of Phase III NEGATIVE_HARD coverage.
-    total_criteria     = 0
-    criteria_with_threshold = 0
-    for r in results:
-        for crit in r.get("inclusion_criteria", []) + r.get("exclusion_criteria", []):
-            total_criteria += 1
-            if (crit.get("threshold", "N/A") != "N/A"
-                    and crit.get("operator",  "N/A") != "N/A"
-                    and crit.get("variable",  "N/A") != "N/A"):
-                criteria_with_threshold += 1
-
-    avg_inclusion = sum(len(r.get("inclusion_criteria", [])) for r in results) / total
-    avg_exclusion = sum(len(r.get("exclusion_criteria", [])) for r in results) / total
-
-    print(f"\n=== Quality Report ===")
-    print(f"  Parsed records    : {total}")
-    print(f"  min_age extracted : {has_min_age}/{total} ({has_min_age/total*100:.1f}%)")
-    print(f"  max_age extracted : {has_max_age}/{total} ({has_max_age/total*100:.1f}%)")
-    print(f"  gender extracted  : {has_gender}/{total}  ({has_gender/total*100:.1f}%)")
-    print(f"\n  Avg inclusion criteria / trial : {avg_inclusion:.1f}")
-    print(f"  Avg exclusion criteria / trial : {avg_exclusion:.1f}")
-    print(f"\n  Criteria with numeric threshold: "
-          f"{criteria_with_threshold}/{total_criteria} "
-          f"({criteria_with_threshold/total_criteria*100:.1f}%)"
-          if total_criteria else "  No criteria found.")
-    print(f"  (This % predicts atomic unit density and NEGATIVE_HARD coverage)")
-
-    # Sample output
-    print(f"\n=== Sample Output ===")
-    first = results[0]
-    print(f"NCT ID     : {first['nct_id']}")
-    print(f"Condition  : {first['condition']}")
-    print(f"Age range  : {first['demographics']['min_age']} ~ "
-          f"{first['demographics']['max_age']}")
-    print(f"Gender     : {first['demographics']['gender']}")
-    print(f"Inclusion  : {len(first['inclusion_criteria'])} criteria")
-    print(f"Exclusion  : {len(first['exclusion_criteria'])} criteria")
-
-    # Show first 3 criteria that have a threshold, to verify extraction quality
-    numeric_examples = [
-        c for c in (first.get("inclusion_criteria", []) +
-                    first.get("exclusion_criteria", []))
-        if c.get("threshold", "N/A") != "N/A"
-    ][:3]
-
-    if numeric_examples:
-        print(f"\nSample numeric criteria:")
-        for ex in numeric_examples:
-            print(f"  Criterion : {ex['criterion'][:80]}")
-            print(f"  Triplet   : <{ex['variable']}, {ex['operator']}, {ex['threshold']}>")
-            print()
+    print(f"\nParsing complete: {completed}/{len(studies)} succeeded")
+    print_quality_report(parsed_records)
+    return parsed_records
 
 
 if __name__ == "__main__":
-    # Start with 50 to verify threshold extraction quality,
-    # then bump to 476 for the full dataset.
-    run_parse(max_studies=50)
+    # Set overwrite=True if you want to rebuild parsed_pico.jsonl from scratch.
+    run_parse(max_studies=None, overwrite=True)
